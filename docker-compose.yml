@@ -1,0 +1,39 @@
+version: "3.9"
+
+services:
+
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: urbansanity-api
+    restart: unless-stopped
+    expose:
+      - "8080"
+    environment:
+      - PORT=8080
+    networks:
+      - app-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  web:
+    image: nginx:1.25-alpine
+    container_name: urbansanity-web
+    restart: unless-stopped
+    ports:
+      - "${WEB_PORT:-18700}:80"
+    volumes:
+      - ./frontend:/usr/share/nginx/html:ro
+      - ./proxy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - api
+    networks:
+      - app-net
+
+networks:
+  app-net:
+    driver: bridge
