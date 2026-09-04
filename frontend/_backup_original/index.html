@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>UrbanSanity — Planification Collecte des Déchets</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Sans+3:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"/>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css"/>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.css"/>
+<link rel="stylesheet" href="styles.css"/>
+</head>
+<body>
+
+<!-- ═══ EN-TÊTE ═══════════════════════════════════════════════════════════ -->
+<header id="app-header">
+  <div class="header-brand">
+    <!-- Logo SVG déchets + agriculture + géospatiale -->
+    <div class="header-logo">
+      <svg width="36" height="36" viewBox="0 0 52 52" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <!-- Globe -->
+        <circle cx="26" cy="26" r="23" stroke="#0082CA" stroke-width="2" fill="#E6F2FA"/>
+        <line x1="26" y1="4" x2="26" y2="48" stroke="#0082CA" stroke-width="0.8"/>
+        <line x1="4" y1="26" x2="48" y2="26" stroke="#0082CA" stroke-width="0.8"/>
+        <!-- Feuille agriculture -->
+        <polygon points="26,44 19,35 17,26 24,18 30,18 35,26 33,35" fill="#27ae60" stroke="#1A7A4A" stroke-width="1.2"/>
+        <!-- Bac à ordures -->
+        <rect x="21" y="9" width="10" height="13" rx="1" fill="#002244" stroke="#002244" stroke-width="1.3"/>
+        <rect x="19" y="21" width="14" height="3" rx="1" fill="#0082CA" stroke="#002244" stroke-width="1"/>
+        <rect x="23" y="24" width="6" height="2" rx="1" fill="#0082CA"/>
+        <!-- Pin géospatial -->
+        <circle cx="40" cy="38" r="4.5" fill="#e74c3c" stroke="#C0392B" stroke-width="1"/>
+        <polygon points="40,28 36,36 44,36" fill="#e74c3c" stroke="#C0392B" stroke-width="1"/>
+      </svg>
+    </div>
+    <div class="header-text">
+      <div class="header-title">UrbanSanity</div>
+      <div class="header-sub">Planification spatiale · Collecte des déchets · Afrique subsaharienne</div>
+    </div>
+  </div>
+  <div class="header-actions">
+    <!-- Sélecteur langue rapport (en-tête) -->
+    <div class="lang-pill">
+      <span class="lang-label">Rapport :</span>
+      <button class="lang-btn active" id="lang-fr" onclick="setReportLang('fr')">🇫🇷 FR</button>
+      <button class="lang-btn" id="lang-en" onclick="setReportLang('en')">🇬🇧 EN</button>
+    </div>
+    <span id="status-badge" class="badge badge-idle">Prêt</span>
+    <button class="btn btn-ghost" onclick="showHowItWorks()">📖 Méthode</button>
+  </div>
+</header>
+
+<div id="main-layout">
+
+  <!-- ═══ BARRE LATÉRALE ════════════════════════════════════════════════ -->
+  <aside id="sidebar">
+
+    <!-- ── ÉTAPE 1 : Zone d'analyse ── -->
+    <div class="panel">
+      <div class="panel-head"><span class="step">1</span>Zone d'analyse (AOI)</div>
+      <div class="panel-body">
+        <div class="row-btns">
+          <button class="btn btn-primary flex1" id="btn-draw" onclick="startDrawPolygon()">✏️ Dessiner polygone</button>
+          <button class="btn btn-icon" onclick="clearAOI()" title="Effacer">🗑</button>
+        </div>
+        <div class="or-divider">ou importer</div>
+        <label class="file-drop">
+          📁 Importer GeoJSON / Shapefile
+          <input type="file" id="import-file" accept=".geojson,.json,.zip" onchange="importFile(this)"/>
+        </label>
+        <div id="aoi-info" class="info-card hidden"></div>
+      </div>
+    </div>
+
+    <!-- ── ÉTAPE 2 : Données OSM ── -->
+    <div class="panel">
+      <div class="panel-head"><span class="step">2</span>Données OpenStreetMap</div>
+      <div class="panel-body">
+        <div class="field-row">
+          <label>Mode :</label>
+          <select id="osm-mode">
+            <option value="quick">⚡ Scan rapide</option>
+            <option value="accurate">🎯 Scan précis</option>
+          </select>
+        </div>
+        <button class="btn btn-primary w100" id="btn-fetch" onclick="fetchOSM()" disabled>
+          📡 Récupérer données OSM
+        </button>
+        <div id="osm-summary" class="info-card hidden"></div>
+      </div>
+    </div>
+
+    <!-- ── ÉTAPE 3 : Paramètres ── -->
+    <div class="panel">
+      <div class="panel-head">
+        <span class="step">3</span>Paramètres d'analyse
+        <button class="collapse-btn" onclick="toggleSection('params-body')">▾</button>
+      </div>
+      <div class="panel-body" id="params-body">
+
+        <div class="section-label">🏘 Population &amp; déchets</div>
+        <div class="param-grid">
+          <div class="param"><label title="Nombre moyen de personnes vivant dans un même ménage (foyer). Sert à estimer la population totale à partir du nombre de bâtiments détectés.">Personnes/ménage (PPH)</label><input type="number" id="p-pph" value="5.0" step="0.1" min="1" max="20"/></div>
+          <div class="param"><label title="Quantité de déchets produits par habitant par jour (kg). 0.42 est la valeur de référence WACA pour le Cameroun.">Déchets kg/pers./jour</label><input type="number" id="p-waste" value="0.42" step="0.01" min="0.1" max="3"/></div>
+          <div class="param"><label title="Taille de chaque cellule de la grille d'analyse spatiale (mètres). Plus petite = analyse plus précise mais plus lente.">Taille grille (m)</label><input type="number" id="p-grid" value="200" step="50" min="50" max="1000"/></div>
+          <div class="param"><label title="Nombre maximal de bacs que l'algorithme peut proposer dans la zone.">Nb max de bacs</label><input type="number" id="p-maxbins" value="30" step="5" min="5" max="100"/></div>
+        </div>
+
+        <div class="section-label">🎯 Anneaux de service</div>
+        <div class="param-grid">
+          <div class="param"><label title="Rayon R1 (mètres) : zone de service proche. Poids W1=0.60 — influence principale sur le score de sélection.">Anneau R1 (m)</label><input type="number" id="p-r1" value="150" step="25" min="50" max="500"/></div>
+          <div class="param"><label title="Rayon R2 (mètres) : zone intermédiaire. Poids W2=0.30 — influence secondaire sur le score.">Anneau R2 (m)</label><input type="number" id="p-r2" value="300" step="25" min="100" max="800"/></div>
+          <div class="param"><label title="Rayon R3 (mètres) : zone étendue. Poids W3=0.10 — faible influence sur le score.">Anneau R3 (m)</label><input type="number" id="p-r3" value="500" step="25" min="200" max="1500"/></div>
+          <div class="param"><label title="Niveau de remplissage du bac (0-1) avant collecte. 0.8 = collecte quand le bac est rempli à 80%.">Seuil remplissage</label><input type="number" id="p-fill" value="0.8" step="0.05" min="0.3" max="1.0"/></div>
+        </div>
+
+        <div class="section-label">⚠️ Distances d'exclusion</div>
+        <div class="param-grid">
+          <div class="param"><label title="Distance minimale (m) entre un bac et une école. Zone tampon de sécurité.">Dist. min école (m)</label><input type="number" id="p-school" value="20" step="5" min="0" max="200"/></div>
+          <div class="param"><label title="Distance minimale (m) entre un bac et un hôpital. Zone tampon sanitaire.">Dist. min hôpital (m)</label><input type="number" id="p-hospital" value="20" step="5" min="0" max="200"/></div>
+          <div class="param"><label title="Distance minimale (m) entre un bac et un cours d'eau ou drain. Protection contre la pollution.">Dist. min eau (m)</label><input type="number" id="p-hydro" value="15" step="5" min="0" max="200"/></div>
+        </div>
+
+        <div class="section-label">⚖️ Poids MCDA (score local)</div>
+        <div class="param-grid">
+          <div class="param"><label title="Poids accordé à la demande en déchets dans le score local du candidat. Plus élevé = on favorise les zones à forte production.">Poids déchets</label><input type="number" id="p-wgt-waste" value="0.45" step="0.05" min="0" max="1"/></div>
+          <div class="param"><label title="Poids accordé à la proximité routière. Plus élevé = on favorise les sites facilement accessibles par véhicule.">Poids accès route</label><input type="number" id="p-wgt-access" value="0.25" step="0.05" min="0" max="1"/></div>
+          <div class="param"><label title="Poids accordé à la proximité des équipements sensibles (écoles, hôpitaux). Plus élevé = on prime les zones denses en équipements.">Poids sensible</label><input type="number" id="p-wgt-sensitive" value="0.15" step="0.05" min="0" max="1"/></div>
+          <div class="param"><label title="Poids accordé à la proximité des points d'eau et drains.">Poids eau/drain</label><input type="number" id="p-wgt-hydro" value="0.15" step="0.05" min="0" max="1"/></div>
+          <div class="param"><label title="Influence de l'anneau R1 (rayon proche) dans le score composite. W1+W2+W3 doivent idéalement sommer à 1.">W1 — poids R1</label><input type="number" id="p-w1" value="0.60" step="0.05" min="0" max="1"/></div>
+          <div class="param"><label title="Influence de l'anneau R2 dans le score composite.">W2 — poids R2</label><input type="number" id="p-w2" value="0.30" step="0.05" min="0" max="1"/></div>
+          <div class="param"><label title="Influence de l'anneau R3 (rayon étendu) dans le score composite.">W3 — poids R3</label><input type="number" id="p-w3" value="0.10" step="0.05" min="0" max="1"/></div>
+          <div class="param"><label title="Distance minimale obligatoire entre deux bacs proposés (mètres). Évite la redondance spatiale.">Espacement min (m)</label><input type="number" id="p-min-spacing" value="125" step="10" min="20" max="1000"/></div>
+        </div>
+
+        <div class="section-label">📐 Sélection spatiale</div>
+        <div class="param-grid">
+          <div class="param"><label title="Importance du score MCDA local dans la sélection finale du site. Favorise les sites intrinsèquement bons.">Sél. — local</label><input type="number" id="p-sel-local" value="0.35" step="0.05" min="0" max="1"/></div>
+          <div class="param"><label title="Importance de la couverture incrémentale (nouvelles personnes desservies) dans la sélection. Favorise l'expansion.">Sél. — couverture</label><input type="number" id="p-sel-coverage" value="0.35" step="0.05" min="0" max="1"/></div>
+          <div class="param"><label title="Importance de la capture additionnelle de déchets dans la sélection.">Sél. — déchets</label><input type="number" id="p-sel-waste" value="0.20" step="0.05" min="0" max="1"/></div>
+          <div class="param"><label title="Pénalité appliquée aux sites qui chevauchent la zone d'influence d'un bac déjà sélectionné. Réduit la redondance.">Pénalité overlap</label><input type="number" id="p-sel-overlap" value="0.10" step="0.05" min="0" max="1"/></div>
+        </div>
+
+        <div class="section-label">🚛 Accès &amp; collecte</div>
+        <div class="param-grid">
+          <div class="param"><label title="Distance maximale (m) entre un bac et une route carrossable pour qu'un camion puisse collecter.">Accès camion (m)</label><input type="number" id="p-truck-access" value="50" step="10" min="0" max="300"/></div>
+          <div class="param"><label title="Largeur minimale de la route (m) pour qu'un camion puisse y circuler.">Largeur route camion</label><input type="number" id="p-truck-roadw" value="3.5" step="0.1" min="1" max="10"/></div>
+          <div class="param"><label title="Distance maximale (m) entre un bac et une route pour qu'un tricycle puisse collecter.">Accès tricycle (m)</label><input type="number" id="p-tricycle-access" value="100" step="10" min="0" max="400"/></div>
+          <div class="param"><label title="Largeur minimale de la route (m) pour un tricycle.">Largeur route tricycle</label><input type="number" id="p-tricycle-roadw" value="2.0" step="0.1" min="0.5" max="6"/></div>
+          <div class="param"><label title="Capacité maximale du bac pour une collecte par camion (kg équivalent).">Capacité camion (kg)</label><input type="number" id="p-cap-truck" value="240" step="10" min="20" max="2000"/></div>
+          <div class="param"><label title="Capacité maximale du bac pour une collecte par tricycle.">Capacité tricycle (kg)</label><input type="number" id="p-cap-tricycle" value="80" step="5" min="5" max="1000"/></div>
+          <div class="param"><label title="Capacité de transport à pied par voyage (kg). Utilisé pour les zones inaccessibles aux véhicules.">Capacité à pied (kg)</label><input type="number" id="p-cap-foot" value="4" step="1" min="1" max="20"/></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── ÉTAPE 4 : Analyse ── -->
+    <div class="panel">
+      <div class="panel-head"><span class="step">4</span>Analyse spatiale</div>
+      <div class="panel-body">
+        <button class="btn btn-success w100" id="btn-analyze" onclick="runAnalysis()" disabled>
+          🔍 Lancer l'analyse
+        </button>
+        <div id="analyze-progress" class="progress-bar hidden"><div id="progress-fill" class="progress-fill"></div></div>
+        <div id="results-summary" class="results-box hidden"></div>
+      </div>
+    </div>
+
+    <!-- ── ÉTAPE 5 : Scénarios (masqué jusqu'à l'analyse) ── -->
+    <div class="panel hidden" id="panel-scenarios">
+      <div class="panel-head"><span class="step">5</span>Scénarios opérationnels</div>
+      <div class="panel-body" id="scenarios-body"></div>
+    </div>
+
+    <!-- ── ÉTAPE 6 : Export ── -->
+    <div class="panel hidden" id="panel-export">
+      <div class="panel-head"><span class="step">6</span>Exporter</div>
+      <div class="panel-body">
+        <div class="export-loc">
+          <label>Zone / Localité <span class="hint">(pour le rapport PDF)</span></label>
+          <input type="text" id="location-name" placeholder="Ex: Yaoundé — Quartier Melen"/>
+          <div class="geocoding-status" id="geocoding-status"></div>
+        </div>
+        <div class="export-btns">
+          <button class="btn btn-export" onclick="exportGeoJSON()">📍 GeoJSON</button>
+          <button class="btn btn-export" onclick="exportCSV()">📊 CSV</button>
+          <button class="btn btn-pdf" onclick="exportPDF()">📄 Rapport PDF</button>
+        </div>
+        <div class="export-lang-note" id="export-lang-note">Rapport en Français 🇫🇷 — changer en haut à droite</div>
+      </div>
+    </div>
+
+    <!-- ── POINT CHECK ── -->
+    <div class="panel panel-amber" id="panel-manual">
+      <div class="panel-head"><span class="step step-amber">✦</span>Point Check Manuel
+        <button class="collapse-btn" onclick="toggleSection('manual-body')">▾</button>
+      </div>
+      <div class="panel-body" id="manual-body">
+        <p class="hint-text">Placez des points sur la carte pour analyser leur zone d'influence et la demande locale.</p>
+        <div class="row-btns">
+          <button class="btn btn-amber w100" id="btn-toggle-placement" onclick="toggleManualPlacement()" disabled>📍 Activer le placement</button>
+          <button class="btn btn-icon" id="btn-clear-manual" onclick="clearManualPoints()" disabled title="Effacer">🗑</button>
+        </div>
+        <div id="manual-point-list"></div>
+        <button class="btn btn-amber-solid w100" id="btn-run-manual" onclick="runManualCheck()" disabled style="margin-top:8px">🔍 Analyser ces points</button>
+        <div id="manual-results" class="hidden"></div>
+      </div>
+    </div>
+
+    <!-- ── COUCHES CARTOGRAPHIQUES ── -->
+    <div class="panel">
+      <div class="panel-head">🗂 Couches cartographiques</div>
+      <div class="panel-body">
+        <div id="layer-toggles"></div>
+        <div id="layers-note" class="hint-text" style="margin-top:6px">Les couches s'affichent après chargement OSM et analyse.</div>
+      </div>
+    </div>
+
+    <div class="sidebar-footer">UrbanSanity · © Contributeurs OSM (ODbL) · Méthodologie Banque Mondiale</div>
+  </aside>
+
+  <!-- ═══ CARTE ═══════════════════════════════════════════════════════════ -->
+  <div id="map"></div>
+
+  <!-- Indicateur placement -->
+  <div id="placement-indicator" class="hidden">📍 Cliquez sur la carte · ESC pour annuler</div>
+
+  <!-- Panneau info (clic sur bac) -->
+  <div id="info-panel" class="hidden">
+    <div class="info-panel-hdr">
+      <span id="info-panel-title">Détails</span>
+      <button onclick="closeInfoPanel()">✕</button>
+    </div>
+    <div id="info-panel-body"></div>
+  </div>
+</div>
+
+<!-- ═══ MODALE MÉTHODE ═══════════════════════════════════════════════════ -->
+<div id="modal-hiw" class="modal hidden">
+  <div class="modal-box">
+    <div class="modal-hdr">
+      <span>📖 Comment ça fonctionne</span>
+      <button onclick="document.getElementById('modal-hiw').classList.add('hidden')">✕</button>
+    </div>
+    <div id="modal-hiw-body" class="modal-body"></div>
+  </div>
+</div>
+
+<div id="toast-container"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
