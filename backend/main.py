@@ -2122,6 +2122,14 @@ async def how_it_works():
         ]
     }
 
+@app.get("/api/config")
+async def public_config():
+    """Configuration publique pour le frontend (fonds de carte).
+    CARTO exige une clé API depuis sept. 2026 : définir CARTO_API_KEY dans Railway."""
+    import os
+    return {"carto_api_key": os.getenv("CARTO_API_KEY", "").strip()}
+
+
 @app.get("/health")
 @app.get("/api/health")
 async def health():

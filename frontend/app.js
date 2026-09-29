@@ -37,10 +37,17 @@ function setReportLang(lang) {
 }
 
 // ── FONDS DE CARTE ─────────────────────────────────────────────────────────
+// Depuis le 23/09/2026, CARTO filigrane ("API KEY REQUIRED") toute tuile sans clé.
+// La clé est lue depuis la variable d'environnement CARTO_API_KEY (Railway) via /api/config.
+// Sans clé, les fonds CARTO basculent automatiquement sur l'équivalent Esri (sans clé, sans filigrane).
+let CARTO_API_KEY = '';
+const ESRI_CANVAS = 'https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/';
 const BASEMAPS = {
-  'carto-light':   { url: 'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',  attr: '© OpenStreetMap contributors, © CartoDB' },
-  'carto-dark':    { url: 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',   attr: '© OpenStreetMap contributors, © CartoDB' },
-  'osm':           { url: 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',              attr: '© OpenStreetMap contributors' },
+  'carto-light':   { url: 'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',  attr: '© OpenStreetMap contributors, © CARTO', carto: true,
+                     fallback: ['World_Light_Gray_Base', 'World_Light_Gray_Reference'] },
+  'carto-dark':    { url: 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',   attr: '© OpenStreetMap contributors, © CARTO', carto: true,
+                     fallback: ['World_Dark_Gray_Base', 'World_Dark_Gray_Reference'] },
+  'osm':           { url: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',                  attr: '© OpenStreetMap contributors' },
   'topo':          { url: 'https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png',                attr: '© OpenTopoMap contributors' },
   'esri-imagery':  { url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', attr: 'Tiles © Esri' },
   'esri-gray':     { url: 'https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}', attr: 'Tiles © Esri' },
@@ -49,6 +56,7 @@ const BASEMAPS = {
 // ── INITIALISATION — UN SEUL DOMContentLoaded ──────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
   initMap();
+  loadMapConfig();
   initLayerToggles();
   checkHealth();
   // Observer pour activer le panel Point Check quand OSM est chargé
@@ -93,10 +101,45 @@ async function geocodeAOI(bbox) {
   }
 }
 
+// ── CONSTRUCTION D'UN FOND DE CARTE ────────────────────────────────────────
+function buildBasemapLayer(key) {
+  const bm = BASEMAPS[key];
+  if (!bm) return null;
+  if (bm.carto) {
+    if (CARTO_API_KEY) {
+      return L.tileLayer(`${bm.url}?key=${encodeURIComponent(CARTO_API_KEY)}`,
+        { attribution: bm.attr, maxZoom: 19, subdomains: 'abcd' });
+    }
+    // Repli sans clé : fond Esri Canvas + étiquettes (même rendu clair/sombre)
+    const opts = { attribution: 'Tiles © Esri — Esri, HERE, Garmin, © OpenStreetMap contributors', maxZoom: 19, maxNativeZoom: 16 };
+    return L.layerGroup([
+      L.tileLayer(`${ESRI_CANVAS}${bm.fallback[0]}/MapServer/tile/{z}/{y}/{x}`, opts),
+      L.tileLayer(`${ESRI_CANVAS}${bm.fallback[1]}/MapServer/tile/{z}/{y}/{x}`, { ...opts, attribution: '' }),
+    ]);
+  }
+  return L.tileLayer(bm.url, { attribution: bm.attr, maxZoom: 19 });
+}
+
+// Récupère la clé CARTO côté serveur puis recharge le fond si besoin
+async function loadMapConfig() {
+  try {
+    const r = await fetch('/api/config');
+    if (!r.ok) return;
+    const cfg = await r.json();
+    const key = (cfg && cfg.carto_api_key) || '';
+    if (!key || key === CARTO_API_KEY) return;
+    CARTO_API_KEY = key;
+    // Invalider les fonds CARTO déjà construits en mode repli
+    Object.keys(BASEMAPS).forEach(k => { if (BASEMAPS[k].carto) delete state.baseLayers[k]; });
+    if (BASEMAPS[state.currentBasemap]?.carto) changeBasemap(state.currentBasemap, true);
+  } catch (e) {
+    console.warn('Config carte indisponible, fonds Esri utilisés :', e);
+  }
+}
+
 // ── INITIALISATION CARTE ───────────────────────────────────────────────────
 function initMap() {
-  const bm = BASEMAPS['carto-light'];
-  const baseLayer = L.tileLayer(bm.url, { attribution: bm.attr, maxZoom: 19 });
+  const baseLayer = buildBasemapLayer('carto-light');
   state.baseLayers['carto-light'] = baseLayer;
   state.layers.basemap = baseLayer;
 
@@ -710,19 +753,19 @@ function toggleLayer(key, visible) {
 }
 
 // ── CHANGEMENT FOND DE CARTE ───────────────────────────────────────────────
-function changeBasemap(key) {
+function changeBasemap(key, silent = false) {
   const bm = BASEMAPS[key];
   if (!bm || !state.map) return;
   if (state.layers.basemap && state.map.hasLayer(state.layers.basemap)) state.map.removeLayer(state.layers.basemap);
   let layer = state.baseLayers[key];
-  if (!layer) { layer = L.tileLayer(bm.url, { attribution: bm.attr, maxZoom: 19 }); state.baseLayers[key] = layer; }
+  if (!layer) { layer = buildBasemapLayer(key); state.baseLayers[key] = layer; }
   state.layers.basemap = layer;
   layer.addTo(state.map);
   if (typeof layer.bringToBack === 'function') layer.bringToBack();
   state.currentBasemap = key;
   const sel = document.getElementById('basemap-select');
   if (sel && sel.value !== key) sel.value = key;
-  toast(`Fond de carte : ${sel?.selectedOptions?.[0]?.text || key}`, 'info', 1200);
+  if (!silent) toast(`Fond de carte : ${sel?.selectedOptions?.[0]?.text || key}`, 'info', 1200);
 }
 
 // ── EXPORT ─────────────────────────────────────────────────────────────────
