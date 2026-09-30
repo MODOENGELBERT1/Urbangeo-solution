@@ -135,3 +135,52 @@ document.addEventListener('DOMContentLoaded', () => {
     if (badge && n) badge.textContent = n;
   }, 600);
 });
+
+
+// ── SESSION UTILISATEUR (contrôle d'accès Geo Wakanda) ─────────────────────
+(function () {
+  // Session expirée pendant l'utilisation → retour à la page de connexion
+  const _fetch = window.fetch.bind(window);
+  window.fetch = async (...args) => {
+    const r = await _fetch(...args);
+    const url = String(args[0] && args[0].url ? args[0].url : args[0] || '');
+    if (r.status === 401 && url.startsWith('/api/') && !url.startsWith('/api/auth/')) {
+      location.href = '/login?next=' + encodeURIComponent(location.pathname);
+    }
+    return r;
+  };
+
+  async function loadUser() {
+    try {
+      const r = await _fetch('/api/auth/me', { credentials: 'same-origin' });
+      if (!r.ok) return;
+      const u = await r.json();
+      if (u.auth_enabled === false) return;
+      const menu = document.getElementById('user-menu');
+      if (!menu) return;
+      const initials = (u.name || u.email || '?').split(/\s+/).filter(Boolean).slice(0, 2).map(w => w[0].toUpperCase()).join('');
+      document.getElementById('user-avatar').textContent = initials || '?';
+      document.getElementById('user-name').textContent = (u.name || '').split(' ')[0];
+      document.getElementById('ud-name').textContent = u.name || '';
+      document.getElementById('ud-email').textContent = u.email || '';
+      document.getElementById('ud-admin').hidden = u.role !== 'admin';
+      menu.hidden = false;
+    } catch (_) { /* hors ligne : on ignore */ }
+  }
+
+  document.addEventListener('click', async (e) => {
+    const btn = document.getElementById('user-btn');
+    const drop = document.getElementById('user-drop');
+    if (!btn || !drop) return;
+    if (e.target.closest('#user-btn')) {
+      drop.hidden = !drop.hidden; btn.setAttribute('aria-expanded', String(!drop.hidden)); return;
+    }
+    if (e.target.closest('#ud-logout')) {
+      await _fetch('/api/auth/logout', { method: 'POST', credentials: 'same-origin' });
+      location.href = '/login'; return;
+    }
+    if (!e.target.closest('#user-drop')) drop.hidden = true;
+  });
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', loadUser); else loadUser();
+})();

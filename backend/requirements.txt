@@ -5,3 +5,5 @@ pydantic==2.7.1
 reportlab==4.2.0
 python-multipart==0.0.9
 aiofiles==23.2.1
+psycopg[binary]==3.2.3
+psycopg-pool==3.2.4

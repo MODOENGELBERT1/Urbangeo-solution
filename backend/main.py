@@ -2412,6 +2412,11 @@ async def manual_check(req: ManualCheckRequest):
     }
 
 
+# ── Contrôle d'accès (inscription, vérification e-mail, validation admin) ───
+from auth import setup_auth
+setup_auth(app)
+
+
 # ── Static Frontend Serving (Railway / production) ─────────────────────────
 # Activated when the frontend/ folder exists next to main.py
 import os as _os
@@ -2442,8 +2447,8 @@ if _os.path.isdir(_FRONTEND_DIR):
             from fastapi import HTTPException
             raise HTTPException(status_code=404, detail="Not found")
         # Try to serve the exact file first (favicon, images, etc.)
-        candidate = _os.path.join(_FRONTEND_DIR, full_path)
-        if _os.path.isfile(candidate):
+        candidate = _os.path.realpath(_os.path.join(_FRONTEND_DIR, full_path))
+        if candidate.startswith(_os.path.realpath(_FRONTEND_DIR) + _os.sep) and _os.path.isfile(candidate):
             return _FileResponse(candidate)
         # SPA fallback → index.html
         return _FileResponse(_os.path.join(_FRONTEND_DIR, "index.html"))

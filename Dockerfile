@@ -12,7 +12,7 @@ COPY backend/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy FastAPI backend
-COPY backend/main.py .
+COPY backend/*.py ./
 
 # Copy frontend static files (served by FastAPI at runtime)
 COPY frontend/ ./frontend/

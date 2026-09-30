@@ -269,6 +269,17 @@
       </div>
       <span id="status-badge" class="badge badge-idle">Prêt</span>
       <button class="btn btn-ghost" onclick="showHowItWorks()">📖 Méthode</button>
+      <div class="user-menu" id="user-menu" hidden>
+        <button class="btn btn-ghost user-btn" id="user-btn" type="button" aria-haspopup="true" aria-expanded="false">
+          <span class="user-avatar" id="user-avatar">?</span><span class="user-name" id="user-name"></span>
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="m6 9 6 6 6-6"/></svg>
+        </button>
+        <div class="user-drop" id="user-drop" hidden>
+          <div class="ud-head"><strong id="ud-name"></strong><span id="ud-email"></span></div>
+          <a href="/admin" id="ud-admin" hidden>Administration des accès</a>
+          <button type="button" id="ud-logout">Se déconnecter</button>
+        </div>
+      </div>
     </div>
 
     <!-- Rail d'outils vertical à droite -->
