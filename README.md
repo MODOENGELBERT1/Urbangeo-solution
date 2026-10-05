@@ -44,3 +44,26 @@ Variables Railway :
 Sans `BREVO_API_KEY`, aucun e-mail n'est envoyé : les liens apparaissent dans les logs Railway et l'administrateur peut valider directement depuis `/admin`.
 
 Note : en mode `docker compose` (nginx), les pages `/login` et `/admin` ne sont pas routées vers l'API ; le contrôle d'accès complet est prévu pour le déploiement mono-conteneur (Railway).
+
+## v13.2 — Performances et fiabilité (octobre 2026)
+
+**Téléchargement OSM**
+- Serveurs Overpass à jour : `overpass.private.coffee` (ex-kumi.systems), `maps.mail.ru`, `overpass-api.de`.
+  Bascule immédiate en cas d'erreur (406, 429, 404, 504, données tronquées) et relais si un serveur est lent.
+- En-tête `User-Agent` identifiable (exigé par les serveurs Overpass).
+- Requête limitée au polygone de la zone (et non plus à son emprise rectangulaire).
+- Réponses compressées (gzip) : ~17 Mo → ~2 Mo transférés pour un quartier de 6 km.
+- Les données restent en mémoire sur le serveur (`osm_key`) : l'analyse n'a plus besoin de les renvoyer.
+- Garde-fou : zone limitée à `MAX_AREA_KM2` (120 km² par défaut, variable Railway).
+
+**Analyse**
+- Index spatiaux (`backend/geo_index.py`) : 65 s → 2,6 s sur un quartier de 6 km × 6 km, résultats strictement identiques.
+- Les calculs lourds ne bloquent plus le serveur (les autres utilisateurs restent servis).
+- Correction : la grille couvre désormais toute la zone quand elle est très grande (> 2 500 cellules).
+
+**Interface**
+- Correction d'une boucle infinie (`ui.js`) qui gelait le navigateur à l'affichage des résultats.
+- Rendu « canvas » des bâtiments et routes (fluide avec des dizaines de milliers d'objets).
+- Messages d'erreur clairs en français.
+
+Variables optionnelles : `OVERPASS_ENDPOINTS` (liste séparée par des virgules), `MAX_AREA_KM2`.

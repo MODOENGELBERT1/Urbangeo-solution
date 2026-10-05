@@ -123,8 +123,10 @@ document.addEventListener('DOMContentLoaded', () => {
   ['panel-scenarios', 'panel-export'].forEach(id => {
     const el = document.getElementById(id);
     if (!el) return;
+    // v13.2 : ne rien faire si le panneau est déjà ouvert. Sinon, classList.add() réécrit
+    // l'attribut « class », ce qui relance l'observateur à l'infini et gèle le navigateur.
     new MutationObserver(() => {
-      if (!el.classList.contains('hidden')) el.classList.add('open');
+      if (!el.classList.contains('hidden') && !el.classList.contains('open')) el.classList.add('open');
     }).observe(el, { attributes: true, attributeFilter: ['class'] });
   });
 

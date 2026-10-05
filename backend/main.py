@@ -5,11 +5,14 @@ Backend API (FastAPI)
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, Response
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 import httpx
 import json
+from geo_index import BuildingIndex, RoadVertexIndex, FeatureDistIndex
 import math
 import time
 import io
@@ -27,7 +30,9 @@ from reportlab.platypus import (
 )
 from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_JUSTIFY
 
-app = FastAPI(title="UrbanSanity API", version="13.0")
+app = FastAPI(title="UrbanSanity API", version="13.2")
+# v13.2 : compression des réponses (les couches OSM passent de ~17 Mo à ~2-3 Mo)
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 app.add_middleware(
     CORSMiddleware,
@@ -36,11 +41,53 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-VERSION = "13.0"
+VERSION = "13.2"
 
-# ── Cache OSM ──────────────────────────────────────────────────────────────
-_osm_cache: Dict[str, Any] = {}
-CACHE_TTL = 600  # 10 min
+# ── Cache OSM (v13.2 : borné en mémoire + réutilisé par l'analyse) ─────────
+_osm_cache: Dict[str, Any] = {}          # cache_key -> {"ts", "data", "osm_key"}
+_osm_by_key: Dict[str, str] = {}         # osm_key  -> cache_key
+CACHE_TTL = 45 * 60                      # 45 min
+CACHE_MAX_ENTRIES = 4                    # évite de saturer la mémoire du conteneur Railway
+MAX_AREA_KM2 = float(__import__("os").getenv("MAX_AREA_KM2", "120"))
+
+
+def _cache_put(cache_key: str, data: Dict[str, Any]) -> str:
+    import uuid
+    now = time.time()
+    for k in [k for k, v in _osm_cache.items() if now - v["ts"] > CACHE_TTL]:
+        _osm_by_key.pop(_osm_cache[k].get("osm_key"), None)
+        _osm_cache.pop(k, None)
+    while len(_osm_cache) >= CACHE_MAX_ENTRIES:
+        oldest = min(_osm_cache, key=lambda k: _osm_cache[k]["ts"])
+        _osm_by_key.pop(_osm_cache[oldest].get("osm_key"), None)
+        _osm_cache.pop(oldest, None)
+    osm_key = uuid.uuid4().hex
+    _osm_cache[cache_key] = {"ts": now, "data": data, "osm_key": osm_key}
+    _osm_by_key[osm_key] = cache_key
+    return osm_key
+
+
+def _cache_get_by_key(osm_key: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not osm_key:
+        return None
+    ck = _osm_by_key.get(osm_key)
+    entry = _osm_cache.get(ck) if ck else None
+    if not entry or time.time() - entry["ts"] > CACHE_TTL:
+        return None
+    entry["ts"] = time.time()  # prolonge la durée de vie tant que la zone est utilisée
+    return entry["data"]
+
+
+def _osm_or_cached(osm_data: Optional[Dict[str, Any]], osm_key: Optional[str]) -> Dict[str, Any]:
+    """Données OSM : celles envoyées par le navigateur, sinon celles gardées en mémoire."""
+    if osm_data:
+        return osm_data
+    cached = _cache_get_by_key(osm_key)
+    if cached is None:
+        raise HTTPException(status_code=409, detail={
+            "code": "osm_expired",
+            "message": "Les données OSM ne sont plus en mémoire sur le serveur. Renvoi automatique…"})
+    return cached
 
 # ── Models ─────────────────────────────────────────────────────────────────
 class BBox(BaseModel):
@@ -55,7 +102,8 @@ class FetchOSMRequest(BaseModel):
     aoi: Optional[Dict[str, Any]] = None
 
 class AnalyzeRequest(BaseModel):
-    osm_data: Dict[str, Any]
+    osm_data: Optional[Dict[str, Any]] = None
+    osm_key: Optional[str] = None
     bbox: BBox
     params: Optional[Dict[str, Any]] = None
     aoi: Optional[Dict[str, Any]] = None
@@ -69,261 +117,253 @@ class ReportRequest(BaseModel):
     aoi: Optional[Dict[str, Any]] = None
     manual_check_result: Optional[Dict[str, Any]] = None
 
-# ── OSM Fetch ──────────────────────────────────────────────────────────────
+# ── OSM Fetch (v13.2) ──────────────────────────────────────────────────────
+# Serveurs Overpass publics (wiki OSM, 2026). overpass.kumi.systems est devenu
+# overpass.private.coffee ; overpass-api.de est souvent surchargé.
 OVERPASS_ENDPOINTS = [
-    "https://overpass-api.de/api/interpreter",
-    "https://overpass.kumi.systems/api/interpreter",
-    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+    e.strip() for e in __import__("os").getenv(
+        "OVERPASS_ENDPOINTS",
+        "https://overpass.private.coffee/api/interpreter,"
+        "https://maps.mail.ru/osm/tools/overpass/api/interpreter,"
+        "https://overpass-api.de/api/interpreter",
+    ).split(",") if e.strip()
 ]
+OVERPASS_HEADERS = {
+    # Les serveurs Overpass refusent (406/429) les requêtes sans User-Agent identifiable.
+    "User-Agent": "UrbanSanity/13.2 (Geo Wakanda - planification de la collecte des dechets; contact: geowakanda4@gmail.com)",
+    "Accept": "application/json",
+}
+OVERPASS_HEDGE_S = 20.0     # si un serveur ne répond pas en 20 s, on interroge aussi le suivant
+OVERPASS_BUDGET_S = 110.0   # durée maximale totale
 
-async def _overpass_query(query: str) -> dict:
-    last_err = None
-    for ep in OVERPASS_ENDPOINTS:
+
+def _host(url: str) -> str:
+    try:
+        return url.split("/")[2]
+    except Exception:
+        return url
+
+
+async def _overpass_query(query: str) -> bytes:
+    """Interroge les serveurs Overpass en cascade : le premier qui répond correctement gagne.
+    Une erreur (406, 429, 504, 404…) fait passer immédiatement au serveur suivant ;
+    un serveur trop lent est doublé par le suivant au bout de OVERPASS_HEDGE_S secondes."""
+    errors: List[str] = []
+    loop_start = time.monotonic()
+    timeout = httpx.Timeout(OVERPASS_BUDGET_S, connect=12.0)
+    async with httpx.AsyncClient(timeout=timeout, headers=OVERPASS_HEADERS, follow_redirects=True) as client:
+
+        async def one(ep: str) -> bytes:
+            r = await client.post(ep, data={"data": query})
+            if r.status_code != 200:
+                raise RuntimeError(f"{_host(ep)} : HTTP {r.status_code}")
+            body = r.content
+            head = body[:2000].decode("utf-8", "ignore")
+            if '"elements"' not in head and "<html" in head.lower():
+                raise RuntimeError(f"{_host(ep)} : réponse non JSON")
+            tail = body[-1500:].decode("utf-8", "ignore")
+            if '"remark"' in tail and ("runtime error" in tail or "timed out" in tail or "out of memory" in tail):
+                # Overpass renvoie alors des données TRONQUÉES : on ne les utilise pas.
+                raise RuntimeError(f"{_host(ep)} : requête interrompue côté serveur (zone trop lourde ou serveur saturé)")
+            return body
+
+        pending: set = set()
+        task_ep: Dict[Any, str] = {}
+        remaining = list(OVERPASS_ENDPOINTS)
+
+        def launch():
+            ep = remaining.pop(0)
+            t = asyncio.create_task(one(ep))
+            task_ep[t] = ep
+            pending.add(t)
+
+        if remaining:
+            launch()
         try:
-            async with httpx.AsyncClient(timeout=45) as client:
-                r = await client.post(ep, data={"data": query})
-                r.raise_for_status()
-                return r.json()
-        except Exception as e:
-            last_err = e
-            continue
-    raise HTTPException(status_code=503, detail=f"Overpass unavailable: {last_err}")
+            while pending:
+                elapsed = time.monotonic() - loop_start
+                left = OVERPASS_BUDGET_S - elapsed
+                if left <= 0:
+                    break
+                wait_for = min(OVERPASS_HEDGE_S, left) if remaining else left
+                done, _ = await asyncio.wait(pending, timeout=wait_for, return_when=asyncio.FIRST_COMPLETED)
+                if not done:
+                    if remaining:
+                        launch()          # serveur lent : on en interroge un autre en parallèle
+                    continue
+                for t in done:
+                    pending.discard(t)
+                    exc = t.exception()
+                    if exc is None:
+                        return t.result()
+                    errors.append(str(exc) or f"{_host(task_ep[t])} : {type(exc).__name__}")
+                    if remaining:
+                        launch()          # échec : serveur suivant immédiatement
+        finally:
+            for t in pending:
+                t.cancel()
+    detail = "; ".join(errors) if errors else "aucune réponse dans le délai"
+    raise HTTPException(status_code=503, detail=(
+        "Les serveurs OpenStreetMap (Overpass) sont indisponibles ou surchargés pour le moment. "
+        "Réessayez dans une minute, ou réduisez la taille de la zone. Détail : " + detail))
 
-def _safe_fc(elements, geom_types=("way", "relation", "node")):
-    """Convert OSM elements to GeoJSON FeatureCollection safely."""
-    features = []
-    for el in elements:
-        if el.get("type") not in geom_types:
-            continue
-        tags = el.get("tags", {})
-        # Node → Point
-        if el["type"] == "node" and "lat" in el:
-            feat = {
-                "type": "Feature",
-                "geometry": {"type": "Point", "coordinates": [el["lon"], el["lat"]]},
-                "properties": tags
-            }
-            features.append(feat)
-        # Way → LineString or Polygon
-        elif el["type"] == "way" and "geometry" in el:
-            coords = [[g["lon"], g["lat"]] for g in el["geometry"]]
-            if len(coords) >= 3 and coords[0] == coords[-1]:
-                geom = {"type": "Polygon", "coordinates": [coords]}
-            else:
-                geom = {"type": "LineString", "coordinates": coords}
-            feat = {"type": "Feature", "geometry": geom, "properties": tags}
-            features.append(feat)
-    return {"type": "FeatureCollection", "features": features}
 
-def _quick_osm_url(bbox: BBox) -> str:
-    return (
-        f"https://api.openstreetmap.org/api/0.6/map"
-        f"?bbox={bbox.west},{bbox.south},{bbox.east},{bbox.north}"
-    )
+# Seules ces étiquettes OSM sont utilisées par l'analyse et l'affichage : on allège la réponse.
+_KEEP_TAGS = ("amenity", "building", "highway", "lanes", "natural", "waterway", "width", "name", "surface")
 
-def _parse_map_api(data: dict):
-    """Parse OSM Map API response into layer dict."""
-    elements = data.get("elements", [])
+
+def _slim(tags: dict) -> dict:
+    return {k: tags[k] for k in _KEEP_TAGS if k in tags}
+
+
+def _clip_feature_like_frontend(feature, ring):
+    """Copie exacte de clipFeatureApprox() du frontend (app.js)."""
+    if not feature or not feature.get("geometry"):
+        return None
+    g = feature["geometry"]; props = feature.get("properties") or {}
+    gt = g.get("type"); c = g.get("coordinates") or []
+    if gt == "Point":
+        return feature if _point_in_ring(c[0], c[1], ring) else None
+    if gt == "LineString":
+        inside = [pt for pt in c if _point_in_ring(pt[0], pt[1], ring)]
+        return {"type": "Feature", "geometry": {"type": "LineString", "coordinates": inside}, "properties": props} if len(inside) >= 2 else None
+    if gt == "Polygon":
+        rc = [pt for pt in (c[0] if c else []) if _point_in_ring(pt[0], pt[1], ring)]
+        if len(rc) < 3:
+            return None
+        closed = rc if (rc[0][0] == rc[-1][0] and rc[0][1] == rc[-1][1]) else rc + [rc[0]]
+        return {"type": "Feature", "geometry": {"type": "Polygon", "coordinates": [closed]}, "properties": props} if len(closed) >= 4 else None
+    return None
+
+
+def _build_osm_layers(raw: bytes, mode: str, aoi_ring) -> Dict[str, Any]:
+    """Transforme la réponse Overpass en couches GeoJSON (exécuté hors de la boucle serveur)."""
+    elements = json.loads(raw).get("elements", [])
     buildings, roads, schools, hospitals, hydro, waste_bins = [], [], [], [], [], []
-
+    accurate = mode != "quick"
     for el in elements:
-        tags = el.get("tags", {})
-        t = el.get("type")
-        if t == "node":
-            geom = {"type": "Point", "coordinates": [el.get("lon", 0), el.get("lat", 0)]}
-        elif t == "way":
-            nd_refs = el.get("nodes", [])
-            # We don't have node coords in map API response easily; skip geometry
-            geom = None
-        else:
-            geom = None
+        tags = _slim(el.get("tags", {}) or {})
+        if el.get("type") == "node" and "lat" in el:
+            pt = {"type": "Feature", "geometry": {"type": "Point", "coordinates": [el["lon"], el["lat"]]}, "properties": tags}
+            amenity = tags.get("amenity", "")
+            if amenity in ("school", "college", "university"):
+                schools.append(pt)
+            elif amenity in ("hospital", "clinic", "doctors"):
+                hospitals.append(pt)
+            elif amenity in ("waste_basket", "recycling", "waste_disposal"):
+                waste_bins.append(pt)
+        elif el.get("type") == "way" and "geometry" in el:
+            coords = [[g["lon"], g["lat"]] for g in el["geometry"] if g]
+            if not coords:
+                continue
+            closed = len(coords) >= 3 and coords[0] == coords[-1]
+            if tags.get("building"):
+                geom = {"type": "Polygon", "coordinates": [coords]} if closed else {"type": "LineString", "coordinates": coords}
+                buildings.append({"type": "Feature", "geometry": geom, "properties": tags})
+            elif tags.get("highway"):
+                roads.append({"type": "Feature", "geometry": {"type": "LineString", "coordinates": coords}, "properties": tags})
+            elif tags.get("waterway") or tags.get("natural") in ("water", "wetland"):
+                geom = {"type": "Polygon", "coordinates": [coords]} if closed else {"type": "LineString", "coordinates": coords}
+                hydro.append({"type": "Feature", "geometry": geom, "properties": tags})
+            elif accurate and tags.get("amenity") == "school":
+                schools.append({"type": "Feature", "geometry": {"type": "LineString", "coordinates": coords}, "properties": tags})
+            elif accurate and tags.get("amenity") == "hospital":
+                hospitals.append({"type": "Feature", "geometry": {"type": "LineString", "coordinates": coords}, "properties": tags})
 
-        if not geom:
-            continue
-
-        feat = {"type": "Feature", "geometry": geom, "properties": tags}
-
-        if tags.get("building"):
-            buildings.append(feat)
-        elif tags.get("highway"):
-            roads.append(feat)
-        elif tags.get("amenity") in ("school", "college", "university"):
-            schools.append(feat)
-        elif tags.get("amenity") in ("hospital", "clinic", "doctors"):
-            hospitals.append(feat)
-        elif tags.get("waterway") or tags.get("natural") in ("water", "wetland"):
-            hydro.append(feat)
-        elif tags.get("amenity") == "waste_basket" or tags.get("amenity") == "recycling":
-            waste_bins.append(feat)
-
-    return {
-        "buildings": {"type": "FeatureCollection", "features": buildings},
-        "roads":     {"type": "FeatureCollection", "features": roads},
-        "schools":   {"type": "FeatureCollection", "features": schools},
-        "hospitals": {"type": "FeatureCollection", "features": hospitals},
-        "hydro":     {"type": "FeatureCollection", "features": hydro},
-        "waste_bins":{"type": "FeatureCollection", "features": waste_bins},
+    fc = lambda feats: {"type": "FeatureCollection", "features": feats}
+    layers: Dict[str, Any] = {
+        "buildings": fc(buildings), "roads": fc(roads), "schools": fc(schools),
+        "hospitals": fc(hospitals), "hydro": fc(hydro), "waste_bins": fc(waste_bins),
+        "source": "Overpass API (Quick)" if not accurate else "Overpass API (Accurate)",
+        "cached": False,
     }
+    if aoi_ring:
+        # Même découpage que celui du navigateur : le résultat de l'analyse ne change pas,
+        # mais on transfère et on garde en mémoire beaucoup moins de données.
+        # (le filtre d'intersection préalable est inutile : un objet découpé non vide
+        #  a forcément au moins un sommet dans la zone)
+        for k in ("buildings", "roads", "schools", "hospitals", "hydro", "waste_bins"):
+            feats = layers[k]["features"]
+            layers[k] = fc([f2 for f2 in (_clip_feature_like_frontend(f, aoi_ring) for f in feats) if f2])
+    layers["message"] = (
+        "No existing waste bins found in the selected area. Analysis will continue using accessibility, safety and waste-demand criteria."
+        if len(layers["waste_bins"]["features"]) == 0 else None
+    )
+    return layers
+
+
+def _overpass_area_filter(bbox: BBox, aoi_ring) -> str:
+    """Filtre spatial Overpass : polygone de la zone si raisonnable, sinon emprise."""
+    if aoi_ring and 4 <= len(aoi_ring) <= 300:
+        return '(poly:"' + " ".join(f"{pt[1]:.7f} {pt[0]:.7f}" for pt in aoi_ring) + '")'
+    return f"({bbox.south},{bbox.west},{bbox.north},{bbox.east})"
+
 
 @app.post("/api/fetch_osm")
 async def fetch_osm(req: FetchOSMRequest):
     bbox = req.bbox
     aoi_ring = _extract_outer_ring(req.aoi)
+    area_km2 = _bbox_area_km2(bbox)
+    if area_km2 > MAX_AREA_KM2:
+        raise HTTPException(status_code=413, detail=(
+            f"Zone trop grande ({area_km2:.0f} km² d'emprise). Maximum : {MAX_AREA_KM2:.0f} km². "
+            "Découpez la zone en plusieurs analyses (par exemple par arrondissement)."))
     aoi_sig = '' if not aoi_ring else ':' + str(round(sum(pt[0] + pt[1] for pt in aoi_ring), 6)) + ':' + str(len(aoi_ring))
     cache_key = f"{bbox.south:.4f},{bbox.west:.4f},{bbox.north:.4f},{bbox.east:.4f}:{req.mode}{aoi_sig}"
-    now = time.time()
-    if cache_key in _osm_cache:
-        cached = _osm_cache[cache_key]
-        if now - cached["ts"] < CACHE_TTL:
-            result = dict(cached["data"])
-            result["cached"] = True
-            return result
+    cached = _osm_cache.get(cache_key)
+    if cached and time.time() - cached["ts"] < CACHE_TTL:
+        cached["ts"] = time.time()
+        result = dict(cached["data"])
+        result["cached"] = True
+        result["osm_key"] = cached["osm_key"]
+        return await _json_response(result)
 
+    f = _overpass_area_filter(bbox, aoi_ring)
     if req.mode == "quick":
-        # Overpass quick query with geometry
         query = f"""
-[out:json][timeout:30];
+[out:json][timeout:90];
 (
-  way["building"]({bbox.south},{bbox.west},{bbox.north},{bbox.east});
-  way["highway"]({bbox.south},{bbox.west},{bbox.north},{bbox.east});
-  node["amenity"~"school|college|university|hospital|clinic|doctors|waste_basket|recycling|waste_disposal"]({bbox.south},{bbox.west},{bbox.north},{bbox.east});
-  way["waterway"]({bbox.south},{bbox.west},{bbox.north},{bbox.east});
-  way["natural"~"water|wetland"]({bbox.south},{bbox.west},{bbox.north},{bbox.east});
+  way["building"]{f};
+  way["highway"]{f};
+  node["amenity"~"school|college|university|hospital|clinic|doctors|waste_basket|recycling|waste_disposal"]{f};
+  way["waterway"]{f};
+  way["natural"~"water|wetland"]{f};
 );
-out geom;
+out geom qt;
 """
-        raw = await _overpass_query(query)
-        elements = raw.get("elements", [])
-
-        buildings, roads, schools, hospitals, hydro, waste_bins = [], [], [], [], [], []
-        for el in elements:
-            tags = el.get("tags", {})
-            if el["type"] == "node" and "lat" in el:
-                pt = {"type": "Feature",
-                      "geometry": {"type": "Point", "coordinates": [el["lon"], el["lat"]]},
-                      "properties": tags}
-                amenity = tags.get("amenity", "")
-                if amenity in ("school", "college", "university"):
-                    schools.append(pt)
-                elif amenity in ("hospital", "clinic", "doctors"):
-                    hospitals.append(pt)
-                elif amenity in ("waste_basket", "recycling", "waste_disposal"):
-                    waste_bins.append(pt)
-            elif el["type"] == "way" and "geometry" in el:
-                coords = [[g["lon"], g["lat"]] for g in el["geometry"]]
-                if not coords:
-                    continue
-                if tags.get("building"):
-                    if len(coords) >= 3 and coords[0] == coords[-1]:
-                        geom = {"type": "Polygon", "coordinates": [coords]}
-                    else:
-                        geom = {"type": "LineString", "coordinates": coords}
-                    buildings.append({"type": "Feature", "geometry": geom, "properties": tags})
-                elif tags.get("highway"):
-                    roads.append({"type": "Feature",
-                                  "geometry": {"type": "LineString", "coordinates": coords},
-                                  "properties": tags})
-                elif tags.get("waterway") or tags.get("natural") in ("water", "wetland"):
-                    geom_type = "Polygon" if (len(coords) >= 3 and coords[0] == coords[-1]) else "LineString"
-                    c = [coords] if geom_type == "Polygon" else coords
-                    hydro.append({"type": "Feature",
-                                  "geometry": {"type": geom_type, "coordinates": c},
-                                  "properties": tags})
-
-        layers = {
-            "buildings": {"type": "FeatureCollection", "features": buildings},
-            "roads":     {"type": "FeatureCollection", "features": roads},
-            "schools":   {"type": "FeatureCollection", "features": schools},
-            "hospitals": {"type": "FeatureCollection", "features": hospitals},
-            "hydro":     {"type": "FeatureCollection", "features": hydro},
-            "waste_bins":{"type": "FeatureCollection", "features": waste_bins},
-            "source": "Overpass API (Quick)",
-            "cached": False,
-        }
     else:
-        # Accurate mode — detailed overpass
         query = f"""
-[out:json][timeout:60];
+[out:json][timeout:100];
 (
-  way["building"]({bbox.south},{bbox.west},{bbox.north},{bbox.east});
-  relation["building"]({bbox.south},{bbox.west},{bbox.north},{bbox.east});
-  way["highway"]({bbox.south},{bbox.west},{bbox.north},{bbox.east});
-  node["amenity"~"school|college|university"]({bbox.south},{bbox.west},{bbox.north},{bbox.east});
-  node["amenity"~"hospital|clinic|doctors"]({bbox.south},{bbox.west},{bbox.north},{bbox.east});
-  node["amenity"~"waste_basket|recycling|waste_disposal"]({bbox.south},{bbox.west},{bbox.north},{bbox.east});
-  way["waterway"]({bbox.south},{bbox.west},{bbox.north},{bbox.east});
-  way["natural"~"water|wetland"]({bbox.south},{bbox.west},{bbox.north},{bbox.east});
-  way["amenity"~"school|hospital"]({bbox.south},{bbox.west},{bbox.north},{bbox.east});
+  way["building"]{f};
+  relation["building"]{f};
+  way["highway"]{f};
+  node["amenity"~"school|college|university"]{f};
+  node["amenity"~"hospital|clinic|doctors"]{f};
+  node["amenity"~"waste_basket|recycling|waste_disposal"]{f};
+  way["waterway"]{f};
+  way["natural"~"water|wetland"]{f};
+  way["amenity"~"school|hospital"]{f};
 );
-out geom;
+out geom qt;
 """
-        raw = await _overpass_query(query)
-        elements = raw.get("elements", [])
-        # same parsing as quick
-        buildings, roads, schools, hospitals, hydro, waste_bins = [], [], [], [], [], []
-        for el in elements:
-            tags = el.get("tags", {})
-            if el["type"] == "node" and "lat" in el:
-                pt = {"type": "Feature",
-                      "geometry": {"type": "Point", "coordinates": [el["lon"], el["lat"]]},
-                      "properties": tags}
-                amenity = tags.get("amenity", "")
-                if amenity in ("school", "college", "university"):
-                    schools.append(pt)
-                elif amenity in ("hospital", "clinic", "doctors"):
-                    hospitals.append(pt)
-                elif amenity in ("waste_basket", "recycling", "waste_disposal"):
-                    waste_bins.append(pt)
-            elif el["type"] == "way" and "geometry" in el:
-                coords = [[g["lon"], g["lat"]] for g in el["geometry"]]
-                if not coords:
-                    continue
-                if tags.get("building"):
-                    geom_t = "Polygon" if (len(coords) >= 3 and coords[0] == coords[-1]) else "LineString"
-                    g_coords = [coords] if geom_t == "Polygon" else coords
-                    buildings.append({"type": "Feature",
-                                      "geometry": {"type": geom_t, "coordinates": g_coords},
-                                      "properties": tags})
-                elif tags.get("highway"):
-                    roads.append({"type": "Feature",
-                                  "geometry": {"type": "LineString", "coordinates": coords},
-                                  "properties": tags})
-                elif tags.get("waterway") or tags.get("natural") in ("water", "wetland"):
-                    geom_t = "Polygon" if (len(coords) >= 3 and coords[0] == coords[-1]) else "LineString"
-                    g_coords = [coords] if geom_t == "Polygon" else coords
-                    hydro.append({"type": "Feature",
-                                  "geometry": {"type": geom_t, "coordinates": g_coords},
-                                  "properties": tags})
-                elif tags.get("amenity") in ("school",):
-                    schools.append({"type": "Feature",
-                                    "geometry": {"type": "LineString", "coordinates": coords},
-                                    "properties": tags})
-                elif tags.get("amenity") in ("hospital",):
-                    hospitals.append({"type": "Feature",
-                                      "geometry": {"type": "LineString", "coordinates": coords},
-                                      "properties": tags})
+    raw = await _overpass_query(query)
+    layers = await run_in_threadpool(_build_osm_layers, raw, req.mode, aoi_ring)
+    del raw
+    osm_key = _cache_put(cache_key, layers)
+    result = dict(layers)
+    result["osm_key"] = osm_key
+    return await _json_response(result)
 
-        layers = {
-            "buildings": {"type": "FeatureCollection", "features": buildings},
-            "roads":     {"type": "FeatureCollection", "features": roads},
-            "schools":   {"type": "FeatureCollection", "features": schools},
-            "hospitals": {"type": "FeatureCollection", "features": hospitals},
-            "hydro":     {"type": "FeatureCollection", "features": hydro},
-            "waste_bins":{"type": "FeatureCollection", "features": waste_bins},
-            "source": "Overpass API (Accurate)",
-            "cached": False,
-        }
 
-    if aoi_ring:
-        for k in ("buildings", "roads", "schools", "hospitals", "hydro", "waste_bins"):
-            layers[k] = _filter_fc_to_aoi(_normalize_fc(layers.get(k)), aoi_ring)
-    layers["message"] = (
-        "No existing waste bins found in the selected area. Analysis will continue using accessibility, safety and waste-demand criteria."
-        if len((layers.get("waste_bins") or {}).get("features", [])) == 0
-        else None
-    )
-    _osm_cache[cache_key] = {"ts": now, "data": layers}
-    return layers
+def _dumps(obj) -> bytes:
+    return json.dumps(obj, separators=(",", ":"), default=str).encode()
+
+
+async def _json_response(obj) -> Response:
+    """Sérialisation JSON directe hors de la boucle serveur (jsonable_encoder est ~8x plus lent)."""
+    body = await run_in_threadpool(_dumps, obj)
+    return Response(content=body, media_type="application/json")
 
 # ── Analysis ────────────────────────────────────────────────────────────────
 def _haversine(lon1, lat1, lon2, lat2):
@@ -582,7 +622,7 @@ def _in_exclusion(lon, lat, excl_zones):
     return False
 
 @app.post("/api/analyze")
-async def analyze(req: AnalyzeRequest):
+def analyze(req: AnalyzeRequest):
     p = req.params or {}
     bbox = req.bbox
     aoi_ring = _extract_outer_ring(req.aoi)
@@ -628,7 +668,7 @@ async def analyze(req: AnalyzeRequest):
     sel_sum = max(sel_weight_local + sel_weight_coverage + sel_weight_waste, 1e-9)
     sel_weight_local, sel_weight_coverage, sel_weight_waste = [w / sel_sum for w in (sel_weight_local, sel_weight_coverage, sel_weight_waste)]
 
-    osm = req.osm_data or {}
+    osm = _osm_or_cached(req.osm_data, req.osm_key) or {}
     buildings_fc = _normalize_fc(osm.get("buildings"))
     roads_fc = _normalize_fc(osm.get("roads"))
     schools_fc = _normalize_fc(osm.get("schools"))
@@ -653,6 +693,20 @@ async def analyze(req: AnalyzeRequest):
     hydro = hydro_fc.get("features", [])
     waste_bins = waste_bins_fc.get("features", [])
 
+    # ── Index spatiaux (v13.2) : mêmes résultats, sans parcourir tout le jeu de données ──
+    _ref_lat = (bbox.south + bbox.north) / 2
+    _bidx = BuildingIndex(buildings, _ref_lat)
+    _ridx = RoadVertexIndex(roads, _haversine, _ref_lat) if roads else None
+    _roads_all_lines = all((f.get("geometry") or {}).get("type") == "LineString" for f in roads)
+    _ridx_lines = (_ridx if _roads_all_lines else RoadVertexIndex(roads, _haversine, _ref_lat, line_only=True)) if roads else None
+    _school_idx = FeatureDistIndex(schools, _haversine, _distance_point_to_segment_m, _point_in_ring, _ref_lat) if schools else None
+    _hosp_idx = FeatureDistIndex(hospitals, _haversine, _distance_point_to_segment_m, _point_in_ring, _ref_lat) if hospitals else None
+    _hydro_idx = FeatureDistIndex(hydro, _haversine, _distance_point_to_segment_m, _point_in_ring, _ref_lat) if hydro else None
+
+    def _on_building(lon, lat, clearance_m=6.0):
+        near = [buildings[i] for i in _bidx.candidates(lon, lat, clearance_m)]
+        return _candidate_on_building(lon, lat, near, clearance_m=clearance_m) if near else False
+
     # Build grid cells only inside AOI if provided
     lat_deg_per_m = 1 / 111320
     lon_deg_per_m = 1 / (111320 * math.cos(math.radians((bbox.south + bbox.north) / 2)))
@@ -665,6 +719,9 @@ async def analyze(req: AnalyzeRequest):
         factor = math.sqrt(lat_steps * lon_steps / 2500)
         lat_steps = max(1, int(lat_steps / factor))
         lon_steps = max(1, int(lon_steps / factor))
+        # v13.2 : élargir les cellules pour couvrir toute l'emprise (avant, l'est et le nord étaient tronqués)
+        dlat = (bbox.north - bbox.south) / lat_steps
+        dlon = (bbox.east - bbox.west) / lon_steps
 
     # Count buildings per cell using centroids
     cell_buildings = {}
@@ -707,10 +764,30 @@ async def analyze(req: AnalyzeRequest):
 
     max_waste = max((c["waste_kg_day"] for c in waste_grid), default=1) or 1
 
+    _cell_by_ij = {(c["i"], c["j"]): c for c in waste_grid}
+    _max_abs_lat = max(abs(bbox.south), abs(bbox.north))
+    _m_per_deg_h = 111195.0  # haversine (R = 6 371 km)
+
+    def _grid_cells_within(lon, lat, radius_m):
+        """Cellules de la grille potentiellement à moins de radius_m, dans l'ordre de waste_grid."""
+        if not waste_grid:
+            return []
+        i0 = int(math.floor((lat - bbox.south) / dlat))
+        j0 = int(math.floor((lon - bbox.west) / dlon))
+        di = int(radius_m / (dlat * _m_per_deg_h)) + 2
+        dj = int(radius_m / (dlon * _m_per_deg_h * max(math.cos(math.radians(_max_abs_lat + 0.5)), 0.05))) + 2
+        out = []
+        for i in range(max(0, i0 - di), min(lat_steps - 1, i0 + di) + 1):
+            for j in range(max(0, j0 - dj), min(lon_steps - 1, j0 + dj) + 1):
+                c = _cell_by_ij.get((i, j))
+                if c is not None:
+                    out.append(c)
+        return out
+
     def _build_site_metrics(lon, lat, *, strict_constraints=True, preserve_position=False, source="new", base_cell=None):
         if aoi_ring and not _point_in_ring(lon, lat, aoi_ring):
             return None
-        if not preserve_position and _candidate_on_building(lon, lat, buildings, clearance_m=6.0):
+        if not preserve_position and _on_building(lon, lat, 6.0):
             moved = False
             offsets = [(0,0), (18,0), (-18,0), (0,18), (0,-18), (18,18), (-18,18), (18,-18), (-18,-18)]
             for ox, oy in offsets:
@@ -718,17 +795,17 @@ async def analyze(req: AnalyzeRequest):
                 lat2 = lat + oy / 111320
                 if aoi_ring and not _point_in_ring(lon2, lat2, aoi_ring):
                     continue
-                if not _candidate_on_building(lon2, lat2, buildings, clearance_m=6.0):
+                if not _on_building(lon2, lat2, 6.0):
                     lon, lat = lon2, lat2
                     moved = True
                     break
             if not moved:
                 return None
 
-        road_d = _nearest_road_dist(lon, lat, roads) if roads else 999
-        school_d = _nearest_feature_distance_m(lon, lat, schools) if schools else float("inf")
-        hospital_d = _nearest_feature_distance_m(lon, lat, hospitals) if hospitals else float("inf")
-        hydro_d = _nearest_feature_distance_m(lon, lat, hydro) if hydro else float("inf")
+        road_d = _ridx.nearest(lon, lat)[0] if roads else 999
+        school_d = _school_idx.distance(lon, lat) if schools else float("inf")
+        hospital_d = _hosp_idx.distance(lon, lat) if hospitals else float("inf")
+        hydro_d = _hydro_idx.distance(lon, lat) if hydro else float("inf")
 
         if strict_constraints and (school_d < min_school_m or hospital_d < min_hospital_m or hydro_d < min_hydro_m):
             return None
@@ -748,7 +825,7 @@ async def analyze(req: AnalyzeRequest):
         ring_cells = []
         r1_pop = r2_pop = r3_pop = 0.0
         waste_r1 = waste_r2 = waste_r3 = 0.0
-        for gc in waste_grid:
+        for gc in _grid_cells_within(lon, lat, max(r1_m, r2_m, r3_m)):
             d = _haversine(lon, lat, gc["lon"], gc["lat"])
             if d <= r1_m:
                 ring_cells.append((gc["idx"], w1))
@@ -811,15 +888,22 @@ async def analyze(req: AnalyzeRequest):
             for cell_id, ring_weight in s.get("ring_cells", []):
                 best_cell_weight[cell_id] = max(best_cell_weight.get(cell_id, 0.0), ring_weight)
 
+        # v13.2 : candidats trop proches d'un site déjà retenu, mis à jour à chaque sélection
+        blocked = [False] * len(candidate_pool)
+        def _block_near(site):
+            for k, cc in enumerate(candidate_pool):
+                if not blocked[k] and _haversine(cc["lon"], cc["lat"], site["lon"], site["lat"]) < min_bin_spacing_m:
+                    blocked[k] = True
+        for s in selected:
+            _block_near(s)
+
         while len(selected) < max_sites:
             best_candidate = None
             best_i = None
             best_objective = -1e18
             best_metrics = None
             for i, c in enumerate(candidate_pool):
-                if i in selected_idx:
-                    continue
-                if any(_haversine(c["lon"], c["lat"], p2["lon"], p2["lat"]) < min_bin_spacing_m for p2 in selected):
+                if i in selected_idx or blocked[i]:
                     continue
 
                 inc_pop = 0.0
@@ -861,6 +945,7 @@ async def analyze(req: AnalyzeRequest):
             chosen.update(best_metrics or {})
             selected.append(chosen)
             selected_idx.add(best_i)
+            _block_near(chosen)
             for cell_id, ring_weight in chosen["ring_cells"]:
                 best_cell_weight[cell_id] = max(best_cell_weight.get(cell_id, 0.0), ring_weight)
         return selected
@@ -1044,7 +1129,10 @@ async def analyze(req: AnalyzeRequest):
     # Enrich proposed bins
     for b in proposed:
         road_d = b["road_dist_m"]
-        _, _, _, road_feat = _nearest_road_point(b["lon"], b["lat"], roads) if roads else (b["lon"], b["lat"], 999, None)
+        road_feat = None
+        if roads:
+            _d, _x, _y, _fi = _ridx_lines.nearest(b["lon"], b["lat"])
+            road_feat = roads[_fi] if _fi is not None else None
         road_width = 0.0
         road_type = "unknown"
         if road_feat:
@@ -1404,7 +1492,7 @@ async def analyze(req: AnalyzeRequest):
 # ── PDF Report — v13.3 Type-Safe Bilingual FR/EN ─────────────────────────────
 
 @app.post("/api/report")
-async def generate_report(req: ReportRequest):
+def generate_report(req: ReportRequest):
     """PDF bilingue (FR/EN) — type-safe, fully tested."""
 
     # ── Helpers type-safe ────────────────────────────────────────────────────
@@ -2139,13 +2227,14 @@ async def health():
 # ── Manual Point Check — v13.1 ───────────────────────────────────────────────
 class ManualCheckRequest(BaseModel):
     points: List[Dict[str, Any]]  # [{id, lat, lon}]
-    osm_data: Dict[str, Any]
+    osm_data: Optional[Dict[str, Any]] = None
+    osm_key: Optional[str] = None
     bbox: BBox
     params: Optional[Dict[str, Any]] = None
     aoi: Optional[Dict[str, Any]] = None
 
 @app.post("/api/manual_check")
-async def manual_check(req: ManualCheckRequest):
+def manual_check(req: ManualCheckRequest):
     """
     Analyze one or more user-placed points on the map.
     Completely independent from /api/analyze — no interference with optimization.
@@ -2153,7 +2242,7 @@ async def manual_check(req: ManualCheckRequest):
     plus a collective coverage summary.
     """
     p       = req.params or {}
-    osm     = req.osm_data
+    osm     = _osm_or_cached(req.osm_data, req.osm_key)
     bbox    = req.bbox
     aoi_gj  = req.aoi
 
@@ -2210,19 +2299,45 @@ async def manual_check(req: ManualCheckRequest):
 
     waste_grid: List[Dict[str, Any]] = []
     idx_counter = 0
+
+    # v13.2 : comptage des bâtiments par cellule en une seule passe (avant : chaque
+    # cellule reparcourait tous les bâtiments). Même règle d'appartenance qu'avant.
+    _col_centers: List[float] = []
+    _lon = bbox.west
+    while _lon <= bbox.east:
+        _col_centers.append(_lon + lon_step / 2); _lon += lon_step
+    _row_centers: List[float] = []
+    _lat = bbox.south
+    while _lat <= bbox.north:
+        _row_centers.append(_lat + lat_step / 2); _lat += lat_step
+    _tol_lon = lon_step / 2 + 1e-7
+    _tol_lat = lat_step / 2 + 1e-7
+    _bld_count: Dict[tuple, int] = {}
+    for b in buildings:
+        cx, cy = _centroid(b)
+        if cx is None:
+            continue
+        kc = int(math.floor((cx - bbox.west) / lon_step))
+        kr = int(math.floor((cy - bbox.south) / lat_step))
+        cols = [k for k in (kc - 1, kc, kc + 1) if 0 <= k < len(_col_centers) and abs(cx - _col_centers[k]) <= _tol_lon]
+        if not cols:
+            continue
+        rows = [k for k in (kr - 1, kr, kr + 1) if 0 <= k < len(_row_centers) and abs(cy - _row_centers[k]) <= _tol_lat]
+        for r in rows:
+            for cc in cols:
+                _bld_count[(r, cc)] = _bld_count.get((r, cc), 0) + 1
+
     lat_cur = bbox.south
+    _r = 0
     while lat_cur <= bbox.north:
         lon_cur = bbox.west
+        _c = 0
         while lon_cur <= bbox.east:
             cell_lon = lon_cur + lon_step / 2
             cell_lat = lat_cur + lat_step / 2
             if aoi_ring and not _point_in_ring(cell_lon, cell_lat, aoi_ring):
-                lon_cur += lon_step; continue
-            n_bldg = sum(
-                1 for b in buildings
-                if abs(_centroid(b)[0] - cell_lon) <= lon_step / 2 + 1e-7
-                and abs(_centroid(b)[1] - cell_lat) <= lat_step / 2 + 1e-7
-            )
+                lon_cur += lon_step; _c += 1; continue
+            n_bldg = _bld_count.get((_r, _c), 0)
             pop      = n_bldg * pph
             waste_kd = pop * waste_kg
             if pop > 0:
@@ -2233,7 +2348,9 @@ async def manual_check(req: ManualCheckRequest):
                 })
                 idx_counter += 1
             lon_cur += lon_step
+            _c += 1
         lat_cur += lat_step
+        _r += 1
 
     max_waste = max((c["waste_kg_day"] for c in waste_grid), default=1.0) or 1.0
     total_pop_aoi = sum(c["population"] for c in waste_grid)

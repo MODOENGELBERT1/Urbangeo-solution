@@ -8,6 +8,7 @@ const state = {
   aoiGeoJSON: null,
   bbox: null,
   osmData: null,
+  osmKey: null,
   analysisResult: null,
   layers: {},
   wasteGrid: [],
@@ -339,6 +340,39 @@ async function importFile(input) {
   input.value = '';
 }
 
+// ── APPELS API (v13.2) ─────────────────────────────────────────────────────
+// Message d'erreur lisible à partir d'une réponse HTTP en échec.
+async function apiErrorMessage(resp) {
+  let detail = '';
+  try {
+    const j = await resp.clone().json();
+    const d = j && j.detail;
+    detail = typeof d === 'string' ? d : (d && (d.message || d.code)) || '';
+  } catch (_) {
+    try { detail = (await resp.text()).slice(0, 200); } catch (_) {}
+  }
+  const generic = {
+    502: 'Le serveur redémarre ou est surchargé. Réessayez dans quelques secondes.',
+    503: 'Service momentanément indisponible. Réessayez dans une minute.',
+    504: 'Le serveur a mis trop de temps à répondre. Essayez une zone plus petite.',
+    404: 'Service introuvable : le serveur est peut-être en cours de redéploiement. Rechargez la page.',
+    413: 'Zone trop grande.',
+  };
+  return detail || generic[resp.status] || `Erreur HTTP ${resp.status}`;
+}
+
+// Envoie une requête qui a besoin des données OSM : on n'envoie que la référence
+// (osm_key) ; si le serveur ne les a plus en mémoire (redémarrage), on renvoie tout.
+async function postWithOsm(url, payload) {
+  const send = (body) => fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  let resp;
+  if (state.osmKey) {
+    resp = await send({ ...payload, osm_key: state.osmKey });
+    if (resp.status !== 409) return resp;
+  }
+  return send({ ...payload, osm_data: state.osmData });
+}
+
 // ── CHARGEMENT OSM ─────────────────────────────────────────────────────────
 async function fetchOSM() {
   if (!state.bbox) { toast('Définir une zone AOI en premier', 'warning'); return; }
@@ -351,9 +385,10 @@ async function fetchOSM() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ bbox: state.bbox, mode, aoi: state.aoiGeoJSON }),
     });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    if (!resp.ok) throw new Error(await apiErrorMessage(resp));
     const data = await resp.json();
     state.osmData = data;
+    state.osmKey = data.osm_key || null;
     setProgress(100);
     setStatus('done', 'OSM chargé');
     renderOSMLayers(data);
@@ -386,6 +421,11 @@ async function fetchOSM() {
   }
 }
 
+// Un seul moteur de rendu « canvas » pour les milliers de bâtiments et routes
+// (le rendu SVG par défaut de Leaflet gèle le navigateur au-delà de ~10 000 objets).
+let _osmCanvas = null;
+function osmCanvas() { if (!_osmCanvas) _osmCanvas = L.canvas({ padding: 0.3 }); return _osmCanvas; }
+
 function renderOSMLayers(data) {
   const filtered = clipDataToAOIForDisplay(filterDataToAOI(data));
   state.osmData = filtered;
@@ -394,12 +434,14 @@ function renderOSMLayers(data) {
   });
   if ((filtered.buildings?.features || []).length > 0) {
     state.layers.osmBuildings = L.geoJSON(filtered.buildings, {
+      renderer: osmCanvas(),
       style: () => ({ color: '#7f8c8d', fillColor: '#bdc3c7', weight: 0.5, fillOpacity: 0.45 })
     });
     if (document.getElementById('lyr-buildings')?.checked) state.layers.osmBuildings.addTo(state.map);
   }
   if ((filtered.roads?.features || []).length > 0) {
     state.layers.osmRoads = L.geoJSON(filtered.roads, {
+      renderer: osmCanvas(),
       style: f => {
         const hw = f.properties?.highway || '';
         const color = hw.includes('primary') ? '#e74c3c' : hw.includes('secondary') ? '#f39c12' : '#95a5a6';
@@ -471,12 +513,8 @@ async function runAnalysis(adaptiveMode = false) {
   };
 
   try {
-    const resp = await fetch('/api/analyze', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ osm_data: state.osmData, bbox: state.bbox, params, aoi: state.aoiGeoJSON }),
-    });
-    if (!resp.ok) { const err = await resp.text(); throw new Error(`HTTP ${resp.status}: ${err}`); }
+    const resp = await postWithOsm('/api/analyze', { bbox: state.bbox, params, aoi: state.aoiGeoJSON });
+    if (!resp.ok) throw new Error(await apiErrorMessage(resp));
     const data = await resp.json();
     state.analysisResult = data;
     setProgress(100);
@@ -811,7 +849,7 @@ async function exportPDF() {
         manual_check_result: manualState.analysisResult || null,
       })
     });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    if (!resp.ok) throw new Error(await apiErrorMessage(resp));
     const blob = await resp.blob();
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -1089,11 +1127,9 @@ async function runManualCheck() {
     w1: parseFloat(document.getElementById('p-w1').value)||0.60, w2: parseFloat(document.getElementById('p-w2').value)||0.30, w3: parseFloat(document.getElementById('p-w3').value)||0.10,
   };
   try {
-    const resp = await fetch('/api/manual_check', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ points: manualState.points.map(p => ({ id: p.id, lat: p.lat, lon: p.lon })), osm_data: state.osmData, bbox: state.bbox, params, aoi: state.aoiGeoJSON }),
-    });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const resp = await postWithOsm('/api/manual_check',
+      { points: manualState.points.map(p => ({ id: p.id, lat: p.lat, lon: p.lon })), bbox: state.bbox, params, aoi: state.aoiGeoJSON });
+    if (!resp.ok) throw new Error(await apiErrorMessage(resp));
     const data = await resp.json();
     manualState.analysisResult = data;
     setStatus('done', 'Points analysés');
